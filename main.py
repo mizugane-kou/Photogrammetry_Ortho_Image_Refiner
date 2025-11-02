@@ -1,4 +1,3 @@
-
 import sys
 import os
 import argparse
@@ -6,13 +5,12 @@ import glob
 import pickle
 import hashlib
 import tempfile
-import subprocess  
+import subprocess
 from datetime import datetime
 from multiprocessing import Pool, cpu_count, freeze_support
 
 import cv2
 import numpy as np
-# 削除: pytoshop, layers, pykakasi は不要になった
 from PySide6.QtCore import (QObject, Qt, QThread, Signal, Slot, QSize, QPointF,
                             QRectF, QPoint, QMargins)
 from PySide6.QtGui import (QPixmap, QImage, QPainter, QPen, QColor, QPolygonF,
@@ -25,9 +23,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QGraphicsView,
                                QGraphicsRectItem, QGraphicsPolygonItem)
 
 
-
-
-CACHE_DIR = ".photogrammetry_enhancer_cache"
+CACHE_DIR = ".Photogrammetry_Ortho_Image_Refiner_cache"
 
 
 def _get_image_hash(image_path):
@@ -56,9 +52,6 @@ def load_cache(ortho_path, detail_path):
         with open(cache_path, 'rb') as f:
             return pickle.load(f)
     return None
-
-
-
 
 
 def export_to_psd(original_ortho_path, png_layer_paths, output_dir):
@@ -92,7 +85,6 @@ def export_to_psd(original_ortho_path, png_layer_paths, output_dir):
     print(f"処理対象ファイル数: {len(all_image_paths)} 件")
 
     try:
-        # バイナリモードで出力をキャプチャ
         result = subprocess.run(
             command,
             cwd=output_dir,
@@ -101,8 +93,6 @@ def export_to_psd(original_ortho_path, png_layer_paths, output_dir):
         )
 
         stdout_text, stderr_text = "", ""
-        # === 変更点 ===
-        # UTF-8でデコードを試み、失敗したらCP932(Shift-JIS)でデコードする
         try:
             stdout_text = result.stdout.decode('utf-8')
             stderr_text = result.stderr.decode('utf-8')
@@ -111,7 +101,6 @@ def export_to_psd(original_ortho_path, png_layer_paths, output_dir):
             stdout_text = result.stdout.decode('cp932', errors='replace')
             stderr_text = result.stderr.decode('cp932', errors='replace')
 
-        # デコード成功、出力を解析
         output_lines = stdout_text.strip().splitlines()
         if not output_lines:
             if stderr_text:
@@ -119,7 +108,6 @@ def export_to_psd(original_ortho_path, png_layer_paths, output_dir):
                 raise RuntimeError(f"img2psd.py の実行に失敗: {stderr_text}")
             raise RuntimeError("img2psd.py が標準出力を返しませんでした。")
 
-        # 最後の行に期待する出力があるか確認
         last_line = output_lines[-1]
         prefix = "PSDファイルを保存しました: "
         if last_line.startswith(prefix):
@@ -127,18 +115,14 @@ def export_to_psd(original_ortho_path, png_layer_paths, output_dir):
             print(f"PSDファイルを正常に保存しました: {output_path}")
             return output_path
         else:
-            # 出力はあったが、期待した文字列ではなかった (Pillowのエラーなど)
             print(f"img2psd.py の予期しない出力: {stdout_text}")
             if stderr_text:
                 print(f"img2psd.py の標準エラー: {stderr_text}")
-            # エラー内容をそのまま例外として投げる
             raise RuntimeError(f"img2psd.pyが処理に失敗しました: {stdout_text}")
 
     except subprocess.CalledProcessError as e:
-        # スクリプト自体が 0 以外のリターンコードで終了した場合
         print("img2psd.py の実行に失敗しました。")
         print(f"リターンコード: {e.returncode}")
-        # エラー出力もデコードを試みる
         try:
             stdout_text = e.stdout.decode('utf-8')
             stderr_text = e.stderr.decode('utf-8')
@@ -188,8 +172,10 @@ class ImageProcessor(QObject):
     def __init__(self):
         super().__init__()
 
+    # --- 変更: 責務を明確化。高精度計算の起点となるメソッド ---
     @Slot(str, str)
     def run_processing(self, ortho_path, detail_path):
+        """ユーザーが画像を選択した後に実行される高精度計算"""
         try:
             self._update_status("画像を読み込んでいます...")
             ortho_img = cv2.imread(ortho_path)
@@ -197,7 +183,9 @@ class ImageProcessor(QObject):
             if ortho_img is None or detail_img is None:
                 raise FileNotFoundError("画像ファイルの読み込みに失敗しました。")
 
-            data = self._align_images(ortho_img, detail_img)
+            # 高精度計算を実行
+            data = self._perform_fine_alignment(ortho_img, detail_img)
+            
             polygons = self._generate_extension_polygons(
                 data['hull_points'], data['warped_corners']
             )
@@ -214,57 +202,12 @@ class ImageProcessor(QObject):
         self.status_updated.emit(message)
         print(message)
 
-    def _parallel_feature_detection(self, image, image_name="画像"):
-        h, w = image.shape[:2]
-        tasks = []
-        for y in range(0, h, TILE_SIZE):
-            for x in range(0, w, TILE_SIZE):
-                tile = image[max(0, y - TILE_OVERLAP):
-                             min(h, y + TILE_SIZE + TILE_OVERLAP),
-                             max(0, x - TILE_OVERLAP):
-                             min(w, x + TILE_SIZE + TILE_OVERLAP)]
-                tasks.append(
-                    (tile, max(0, x - TILE_OVERLAP), max(0, y - TILE_OVERLAP))
-                )
-
-        num_cores = max(1, cpu_count() - 1)
-        self._update_status(
-            f"[{image_name}] {len(tasks)}個のタイルを{num_cores}コアで並列検出中..."
-        )
-        with Pool(processes=num_cores) as pool:
-            results = pool.map(detect_features_in_tile, tasks)
-
-        all_kp_tuples = [kp for tile_kps in results for kp in tile_kps]
-        self._update_status(
-            f"[{image_name}] 候補点 {len(all_kp_tuples)}個から重複を排除中..."
-        )
-        all_kp_tuples.sort(key=lambda item: item[2], reverse=True)
-
-        grid, unique_kp_tuples = {}, []
-        for kp_tuple in all_kp_tuples:
-            grid_key = (int(kp_tuple[0] / DEDUPLICATION_GRID_SIZE),
-                        int(kp_tuple[1] / DEDUPLICATION_GRID_SIZE))
-            if grid_key not in grid:
-                grid[grid_key] = True
-                unique_kp_tuples.append(kp_tuple)
-
-        if len(unique_kp_tuples) > MAX_FEATURES_FOR_MATCHING:
-            self._update_status(
-                f"[{image_name}] {len(unique_kp_tuples)}個から"
-                f"品質上位{MAX_FEATURES_FOR_MATCHING}個を選抜。"
-            )
-            unique_kp_tuples = unique_kp_tuples[:MAX_FEATURES_FOR_MATCHING]
-        else:
-            self._update_status(
-                f"[{image_name}] {len(unique_kp_tuples)}個のユニークな特徴点を検出。"
-            )
-        return unique_kp_tuples
-
-    def _align_images(self, ortho_img, detail_img):
+    # --- 新規: 荒いアライメントを実行するロジックを独立 ---
+    def _perform_coarse_alignment(self, ortho_img, detail_img):
+        """低解像度画像で荒いマッチングのみ行い、位置情報を返す"""
         ortho_h, ortho_w = ortho_img.shape[:2]
         detail_h, detail_w = detail_img.shape[:2]
 
-        self._update_status("[Coarse] 低解像度で大まかな位置を探索中...")
         scale_o = RESIZE_WIDTH_COARSE / ortho_w
         ortho_small = cv2.resize(
             ortho_img, (RESIZE_WIDTH_COARSE, int(ortho_h * scale_o)),
@@ -296,50 +239,48 @@ class ImageProcessor(QObject):
         dst_pts = np.float32(
             [kp_o_s[m.trainIdx].pt for m in good_matches]
         ).reshape(-1, 1, 2) / scale_o
-        M_coarse, mask_coarse = cv2.findHomography(
-            src_pts, dst_pts, cv2.RANSAC, 5.0
-        )
+        M_coarse, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
         if M_coarse is None:
             raise ValueError("[Coarse] 初期ホモグラフィの計算に失敗。")
 
+        src_corners = np.float32(
+            [[0, 0], [detail_w, 0], [detail_w, detail_h], [0, detail_h]]
+        ).reshape(-1, 1, 2)
+        warped_corners = cv2.perspectiveTransform(src_corners, M_coarse).squeeze(axis=1)
+
+        return {"warped_corners": warped_corners, "M_coarse": M_coarse}
+
+    # --- 新規: 高精度アライメントを実行するロジックを独立 ---
+    def _perform_fine_alignment(self, ortho_img, detail_img):
+        """フル解像度画像で高精度なアライメントを行う"""
+        ortho_h, ortho_w = ortho_img.shape[:2]
+        detail_h, detail_w = detail_img.shape[:2]
+
+        self._update_status("[Coarse] 荒い位置合わせを再計算中...")
+        coarse_data = self._perform_coarse_alignment(ortho_img, detail_img)
+        M_coarse = coarse_data["M_coarse"]
+        
         self._update_status("[Fine] 関心領域を特定中...")
-        hull = cv2.convexHull(
-            dst_pts[mask_coarse.ravel() == 1], returnPoints=True
-        )
-        x, y, w, h = cv2.boundingRect(hull)
+        # 荒いホモグラフィからROIを決定
+        coarse_corners = coarse_data["warped_corners"]
+        x, y, w, h = cv2.boundingRect(coarse_corners.astype(np.int32))
+        
         ortho_roi = ortho_img[
-            max(0, y - HULL_MARGIN_PIXELS):
-            min(ortho_h, y + h + HULL_MARGIN_PIXELS),
-            max(0, x - HULL_MARGIN_PIXELS):
-            min(ortho_w, x + w + HULL_MARGIN_PIXELS)
+            max(0, y - HULL_MARGIN_PIXELS): min(ortho_h, y + h + HULL_MARGIN_PIXELS),
+            max(0, x - HULL_MARGIN_PIXELS): min(ortho_w, x + w + HULL_MARGIN_PIXELS)
         ]
 
-        kp_ortho_tuples_roi = self._parallel_feature_detection(
-            ortho_roi, "オルソ画像ROI"
-        )
-        kp_detail_tuples = self._parallel_feature_detection(
-            detail_img, "詳細画像(フル)"
-        )
+        # ここから高コストな並列計算
+        kp_ortho_tuples_roi = self._parallel_feature_detection(ortho_roi, "オルソ画像ROI")
+        kp_detail_tuples = self._parallel_feature_detection(detail_img, "詳細画像(フル)")
 
         kp_ortho_tuples = [
             (t[0] + max(0, x - HULL_MARGIN_PIXELS),
              t[1] + max(0, y - HULL_MARGIN_PIXELS), *t[2:])
             for t in kp_ortho_tuples_roi
         ]
-        kp_ortho = [
-            cv2.KeyPoint(
-                x=t[0], y=t[1], size=t[3], angle=t[4], response=t[2],
-                octave=t[5], class_id=t[6]
-            )
-            for t in kp_ortho_tuples
-        ]
-        kp_detail = [
-            cv2.KeyPoint(
-                x=t[0], y=t[1], size=t[3], angle=t[4], response=t[2],
-                octave=t[5], class_id=t[6]
-            )
-            for t in kp_detail_tuples
-        ]
+        kp_ortho = [cv2.KeyPoint(x=t[0], y=t[1], size=t[3], angle=t[4], response=t[2], octave=t[5], class_id=t[6]) for t in kp_ortho_tuples]
+        kp_detail = [cv2.KeyPoint(x=t[0], y=t[1], size=t[3], angle=t[4], response=t[2], octave=t[5], class_id=t[6]) for t in kp_detail_tuples]
 
         self._update_status("[Fine] SIFTディスクリプタを計算し、最終マッチングを実行中...")
         sift_fine = cv2.SIFT_create()
@@ -347,23 +288,16 @@ class ImageProcessor(QObject):
         _, des_detail = sift_fine.compute(detail_img, kp_detail)
         if des_detail is None or des_ortho is None:
             raise ValueError("[Fine] 特徴量計算失敗")
-
+        
+        bf = cv2.BFMatcher(cv2.NORM_L2)
         matches = bf.knnMatch(des_detail, des_ortho, k=2)
-        good_matches = [m for m_n in matches if
-                        len(m_n) == 2 and (m := m_n[0]) and (n := m_n[1]) and
-                        m.distance < RATIO_TEST_THRESHOLD * n.distance]
+        good_matches = [m for m_n in matches if len(m_n) == 2 and (m := m_n[0]) and (n := m_n[1]) and m.distance < RATIO_TEST_THRESHOLD * n.distance]
         if len(good_matches) < 10:
             raise ValueError("[Fine] 対応点が少なすぎます。")
 
-        src_pts = np.float32(
-            [kp_detail[m.queryIdx].pt for m in good_matches]
-        ).reshape(-1, 1, 2)
-        dst_pts = np.float32(
-            [kp_ortho[m.trainIdx].pt for m in good_matches]
-        ).reshape(-1, 1, 2)
-        M_fine, mask_fine = cv2.findHomography(
-            src_pts, dst_pts, cv2.RANSAC, RANSAC_REPROJ_THRESHOLD
-        )
+        src_pts = np.float32([kp_detail[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kp_ortho[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+        M_fine, mask_fine = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, RANSAC_REPROJ_THRESHOLD)
         if M_fine is None:
             raise ValueError("[Fine] 最終ホモグラフィ計算失敗")
 
@@ -371,20 +305,50 @@ class ImageProcessor(QObject):
         inlier_dst_pts = dst_pts[mask_fine.ravel() == 1]
         if len(inlier_dst_pts) < 3:
             raise ValueError("凸包計算のための点が不足しています。")
-        hull_points = cv2.convexHull(
-            inlier_dst_pts, returnPoints=True
-        ).squeeze(axis=1)
-        src_corners = np.float32(
-            [[0, 0], [detail_w, 0], [detail_w, detail_h], [0, detail_h]]
-        ).reshape(-1, 1, 2)
-        warped_corners = cv2.perspectiveTransform(
-            src_corners, M_fine
-        ).squeeze(axis=1)
+        hull_points = cv2.convexHull(inlier_dst_pts, returnPoints=True).squeeze(axis=1)
+        
+        src_corners = np.float32([[0, 0], [detail_w, 0], [detail_w, detail_h], [0, detail_h]]).reshape(-1, 1, 2)
+        warped_corners = cv2.perspectiveTransform(src_corners, M_fine).squeeze(axis=1)
+        
         return {
             "homography_matrix": M_fine,
             "hull_points": hull_points,
             "warped_corners": warped_corners
         }
+
+    def _parallel_feature_detection(self, image, image_name="画像"):
+        h, w = image.shape[:2]
+        tasks = []
+        for y in range(0, h, TILE_SIZE):
+            for x in range(0, w, TILE_SIZE):
+                tile = image[max(0, y - TILE_OVERLAP):min(h, y + TILE_SIZE + TILE_OVERLAP),
+                             max(0, x - TILE_OVERLAP):min(w, x + TILE_SIZE + TILE_OVERLAP)]
+                tasks.append((tile, max(0, x - TILE_OVERLAP), max(0, y - TILE_OVERLAP)))
+
+        num_cores = max(1, cpu_count() - 1)
+        self._update_status(f"[{image_name}] {len(tasks)}個のタイルを{num_cores}コアで並列検出中...")
+        with Pool(processes=num_cores) as pool:
+            results = pool.map(detect_features_in_tile, tasks)
+
+        all_kp_tuples = [kp for tile_kps in results for kp in tile_kps]
+        self._update_status(f"[{image_name}] 候補点 {len(all_kp_tuples)}個から重複を排除中...")
+        all_kp_tuples.sort(key=lambda item: item[2], reverse=True)
+
+        grid, unique_kp_tuples = {}, []
+        for kp_tuple in all_kp_tuples:
+            grid_key = (int(kp_tuple[0] / DEDUPLICATION_GRID_SIZE),
+                        int(kp_tuple[1] / DEDUPLICATION_GRID_SIZE))
+            if grid_key not in grid:
+                grid[grid_key] = True
+                unique_kp_tuples.append(kp_tuple)
+
+        if len(unique_kp_tuples) > MAX_FEATURES_FOR_MATCHING:
+            self._update_status(f"[{image_name}] {len(unique_kp_tuples)}個から品質上位{MAX_FEATURES_FOR_MATCHING}個を選抜。")
+            unique_kp_tuples = unique_kp_tuples[:MAX_FEATURES_FOR_MATCHING]
+        else:
+            self._update_status(f"[{image_name}] {len(unique_kp_tuples)}個のユニークな特徴点を検出。")
+        return unique_kp_tuples
+
 
     def _get_line_intersection(self, p1, p2, p3, p4):
         p1, p2, p3, p4 = np.array(p1), np.array(p2), np.array(p3), np.array(p4)
@@ -491,8 +455,6 @@ class ImageProcessor(QObject):
         cv2.imwrite(png_path, warped_detail_bgra)
         self._update_status(f"処理完了！ ファイルを保存しました: {png_path}")
         self.composition_saved.emit(png_path)
-
-
 
 
 class UpdateWorker(QObject):
@@ -649,7 +611,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, ortho_path, detail_dir):
         super().__init__()
-        self.setWindowTitle("Photogrammetry Enhancer (Final)")
+        self.setWindowTitle("Photogrammetry_Ortho_Image_Refiner")
         self.setGeometry(100, 100, 1400, 900)
         self.initial_ortho_path, self.detail_dir = ortho_path, detail_dir
         self.detail_paths = glob.glob(
@@ -759,6 +721,7 @@ class MainWindow(QMainWindow):
             return
         dialog = CandidateDialog(candidates, self)
         if dialog.exec():
+            # --- 変更: 候補選択後は、キャッシュの有無に関わらず高精度計算をキックする ---
             self.find_button.setEnabled(False)
             self.status_label.setText("高精度計算をバックグラウンドで開始します...")
             self.start_processing_signal.emit(
@@ -881,7 +844,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "警告", "エクスポートするレイヤーがありません。")
             return
         try:
-            # 'outputs' ディレクトリを指定
             output_dir = "outputs"
             path = export_to_psd(
                 self.initial_ortho_path, self.generated_pngs, output_dir
@@ -906,15 +868,105 @@ class MainWindow(QMainWindow):
                 print(f"一時ファイルの削除に失敗: {e}")
         event.accept()
 
+# --- 変更: 事前計算を軽量なCoarse Alignmentのみに限定 ---
+def run_precomputation_coarse(ortho_path, detail_dir):
+    """GUI起動前に、荒いアライメント計算のみを行い位置情報キャッシュを作成する"""
+    print("--- 事前計算(荒いマッチング)を開始します ---")
+    print(f"オルソ画像: {ortho_path}")
+    print(f"詳細画像ディレクトリ: {detail_dir}")
+
+    detail_paths = glob.glob(os.path.join(detail_dir, "*.jpg")) + \
+                   glob.glob(os.path.join(detail_dir, "*.png"))
+
+    if not detail_paths:
+        print("警告: 指定されたディレクトリに詳細画像が見つかりませんでした。")
+        return
+
+    # --- 高速化対応①: 先にオルソ画像のハッシュを一度だけ計算 ---
+    print("基準となるオルソ画像のハッシュを計算中...")
+    try:
+        ortho_hash = _get_image_hash(ortho_path)
+    except FileNotFoundError:
+        print(f"!!! エラー: オルソ画像が見つかりません: {ortho_path}")
+        return
+    print("-> ハッシュ計算完了。")
+
+    # --- 高速化対応②: 既存のキャッシュから詳細ハッシュの一覧をメモリに読み込む ---
+    existing_detail_hashes = set()
+    if os.path.exists(CACHE_DIR):
+        print("既存のキャッシュ情報をメモリに読み込んでいます...")
+        prefix = f"{ortho_hash}_"
+        for filename in os.listdir(CACHE_DIR):
+            if filename.startswith(prefix) and filename.endswith(".pkl"):
+                # ファイル名から詳細画像のハッシュ部分を抽出
+                detail_hash = filename[len(prefix):-4]
+                existing_detail_hashes.add(detail_hash)
+        print(f"-> {len(existing_detail_hashes)} 件の既存キャッシュ情報を確認しました。")
+
+    processor = ImageProcessor()
+    
+    # オルソ画像は最初に一度だけ読み込む
+    ortho_img = cv2.imread(ortho_path)
+    if ortho_img is None:
+        print(f"!!! エラー: オルソ画像が読み込めません: {ortho_path}")
+        return
+
+    processed_count = 0
+    newly_cached_count = 0
+    for i, detail_path in enumerate(detail_paths):
+        base_detail_name = os.path.basename(detail_path)
+        # ログが流れすぎないように\rで出力行を更新
+        print(f"\r[{i+1}/{len(detail_paths)}] 確認中: {base_detail_name.ljust(40)}", end="")
+
+        try:
+            # --- 高速化対応③: 詳細画像のハッシュを計算（これは不可避） ---
+            detail_hash = _get_image_hash(detail_path)
+
+            # --- 高速化対応④: ファイルシステムではなく、メモリ上のSetに対して存在確認 ---
+            if detail_hash in existing_detail_hashes:
+                # キャッシュが見つかったので、次のファイルへ
+                continue
+
+            # --- 以下はキャッシュが存在しない場合の処理 ---
+            print(f"\r[{i+1}/{len(detail_paths)}] 計算中: {base_detail_name.ljust(40)}", end="")
+
+            detail_img = cv2.imread(detail_path)
+            if detail_img is None:
+                raise FileNotFoundError("詳細画像ファイルの読み込みに失敗しました。")
+
+            # 荒い計算のみ実行
+            coarse_alignment_data = processor._perform_coarse_alignment(ortho_img, detail_img)
+            
+            # 位置情報のみをキャッシュに保存
+            cache_data = {"warped_corners": coarse_alignment_data["warped_corners"]}
+            save_cache(ortho_path, detail_path, cache_data)
+            
+            # 新しくキャッシュに追加したハッシュをメモリのSetにも追加しておく
+            existing_detail_hashes.add(detail_hash)
+            newly_cached_count += 1
+
+        except Exception as e:
+            # エラー発生時には改行して、エラーログを見やすくする
+            print(f"\n!!! エラーが発生しました: {base_detail_name} - {e}")
+    
+    # 最終結果を改行して表示
+    print(f"\n\n--- 事前計算が完了しました ({newly_cached_count}件のキャッシュを新規作成) ---")
+
+
 
 if __name__ == '__main__':
     freeze_support()
-    parser = argparse.ArgumentParser(description='対話的な写真補正・合成ツール')
+    parser = argparse.ArgumentParser(description='Photogrammetry_Ortho_Image_Refiner')
     parser.add_argument('ortho_image', help='基準となるオルソ画像のパス')
+    # --- 修正: add-argument -> add_argument ---
     parser.add_argument('detail_images_dir',
                         help='高解像度詳細画像が含まれるディレクトリ')
     args = parser.parse_args()
 
+    # --- GUI起動前に軽量な事前計算を実行 ---
+    run_precomputation_coarse(args.ortho_image, args.detail_images_dir)
+
+    print("GUIを起動します...")
     app = QApplication(sys.argv)
     window = MainWindow(args.ortho_image, args.detail_images_dir)
     window.show()
