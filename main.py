@@ -10,7 +10,6 @@ import tempfile
 import subprocess
 from datetime import datetime
 from multiprocessing import Pool, cpu_count, freeze_support
-# --- ▼▼▼【追加】並列処理とプログレスバーのためにライブラリをインポート ▼▼▼ ---
 import concurrent.futures
 from functools import partial
 from collections import defaultdict
@@ -22,7 +21,7 @@ except ImportError:
     print("より良い体験のために 'pip install tqdm' の実行をお勧めします。")
     def tqdm(iterable, **kwargs):
         return iterable
-# --- ▲▲▲ 追加はここまで ▲▲▲ ---
+
 
 
 import cv2
@@ -493,7 +492,7 @@ class PhotoViewer(QGraphicsView):
     def clear_selection(self): self.selection_rect_item.hide()
 
 
-# --- ▼▼▼【修正】CandidateDialogのレイアウトと機能性を改善 ▼▼▼ ---
+
 class CandidateDialog(QDialog):
     def __init__(self, candidates, parent=None):
         super().__init__(parent)
@@ -501,15 +500,14 @@ class CandidateDialog(QDialog):
         self.selected_path = None
         layout, self.list_widget = QVBoxLayout(self), QListWidget()
 
-        # --- 表示モードとレイアウトの設定 ---
-        self.list_widget.setViewMode(QListWidget.IconMode)  # アイコンを上に、テキストを下に配置
-        self.list_widget.setResizeMode(QListWidget.Adjust)   # ウィンドウサイズ変更に追従してアイテムを再配置
-        self.list_widget.setWordWrap(True)                   # ファイル名を折り返して表示
-        self.list_widget.setSpacing(15)                      # アイテム間の余白を調整
+        self.list_widget.setViewMode(QListWidget.IconMode)
+        self.list_widget.setResizeMode(QListWidget.Adjust)
+        self.list_widget.setWordWrap(True)
+        self.list_widget.setSpacing(15)
+
+        self.list_widget.verticalScrollBar().setSingleStep(30)
 
         self.list_widget.setIconSize(QSize(THUMBNAIL_SIZE, THUMBNAIL_SIZE))
-        
-        # --- ★ダブルクリックの接続先を accept から新しいメソッドに変更 ---
         self.list_widget.itemDoubleClicked.connect(self.on_item_double_clicked)
 
         for path, thumb in candidates:
@@ -518,7 +516,6 @@ class CandidateDialog(QDialog):
             
             item.setIcon(QIcon(thumb))
             item.setData(Qt.UserRole, path)
-            # --- ★ ツールチップを追加して、フルパスを表示 ---
             item.setToolTip(path)
             item.setTextAlignment(Qt.AlignCenter)
             
@@ -532,10 +529,7 @@ class CandidateDialog(QDialog):
         self.resize(THUMBNAIL_SIZE + 100, 800)
 
     def on_item_double_clicked(self, item):
-        """
-        リストアイテムがダブルクリックされたときに、
-        対応する画像をOSのデフォルトビューアーで開く。
-        """
+        """リストアイテムがダブルクリックされたときに、対応する画像をOSのデフォルトビューアーで開く。"""
         path = item.data(Qt.UserRole)
         try:
             filepath = os.path.realpath(path)
@@ -549,10 +543,7 @@ class CandidateDialog(QDialog):
             QMessageBox.warning(self, "エラー", f"ファイルを開けませんでした:\n{path}\n\n詳細: {e}")
 
     def accept(self):
-        """
-        OKボタンまたはEnterキーで呼び出される。
-        現在選択されているアイテムを最終的な選択として確定する。
-        """
+        """OKボタンまたはEnterキーで呼び出される。現在選択されているアイテムを最終的な選択として確定する。"""
         selected_items = self.list_widget.selectedItems()
         if selected_items:
             self.selected_path = selected_items[0].data(Qt.UserRole)
@@ -560,7 +551,7 @@ class CandidateDialog(QDialog):
         else:
             # 何も選択されていなくてもダイアログを閉じる
             super().accept()
-# --- ▲▲▲ 修正はここまで ▲▲▲ ---
+
 
 
 class MainWindow(QMainWindow):
@@ -591,11 +582,15 @@ class MainWindow(QMainWindow):
         self.view = PhotoViewer(self.scene)
         self.find_button = QPushButton("② この領域で候補を検索")
         self.confirm_button = QPushButton("✅ 選択を確定して合成")
+
+        self.cancel_button = QPushButton("❌ キャンセル")
         self.export_button = QPushButton("📦 PSDとしてエクスポート")
         central_widget, main_layout = QWidget(), QVBoxLayout()
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.find_button)
         button_layout.addWidget(self.confirm_button)
+
+        button_layout.addWidget(self.cancel_button)
         button_layout.addStretch()
         button_layout.addWidget(self.export_button)
         main_layout.addWidget(self.status_label)
@@ -631,6 +626,8 @@ class MainWindow(QMainWindow):
         self.view.region_selected.connect(self.on_region_selected)
         self.find_button.clicked.connect(self.on_find_button_clicked)
         self.confirm_button.clicked.connect(self.save_result)
+
+        self.cancel_button.clicked.connect(self.reset_ui_state)
         self.export_button.clicked.connect(self.export_project)
         
         self.proc_thread.start()
@@ -669,6 +666,8 @@ class MainWindow(QMainWindow):
     def reset_ui_state(self):
         self.find_button.setEnabled(False)
         self.confirm_button.setEnabled(False)
+
+        self.cancel_button.setEnabled(False)
         self.export_button.setEnabled(len(self.generated_pngs) > 0)
         self.view.set_mode(self.view.MODE_SELECTION)
         for item in self.selectable_items: self.scene.removeItem(item)
@@ -738,6 +737,8 @@ class MainWindow(QMainWindow):
             self.selectable_items.append(item)
             self.selected_states.append(False)
         self.confirm_button.setEnabled(True)
+
+        self.cancel_button.setEnabled(True)
         self.status_label.setText("③ 合成に含めたい拡張領域をクリックし、「選択を確定して合成」を押すか、Enterキーを押してください。")
 
     def toggle_selection(self, index):
@@ -756,6 +757,7 @@ class MainWindow(QMainWindow):
         final_polygons = [QPolygonF([QPointF(*p) for p in self.data["hull_points"]])]
         final_polygons.extend(self.data['extension_polygons'][i] for i, selected in enumerate(self.selected_states) if selected)
         self.confirm_button.setEnabled(False)
+        self.cancel_button.setEnabled(False) # 確定処理中はキャンセルも不可に
         self.processor.create_and_save_final_image(self.data, final_polygons)
 
     def on_composition_saved(self, png_path):
