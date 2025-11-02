@@ -1,2 +1,1 @@
 # Photogrammetry_Ortho_Image_Refiner
-フォトグラメトリで構成したオルソ画像の欠落・歪み・シャープネス損失をソース写真を使って修復する
