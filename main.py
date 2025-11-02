@@ -1,3 +1,5 @@
+
+
 import sys
 import os
 import argparse
@@ -11,12 +13,13 @@ from multiprocessing import Pool, cpu_count, freeze_support
 # --- ▼▼▼【追加】並列処理とプログレスバーのためにライブラリをインポート ▼▼▼ ---
 import concurrent.futures
 from functools import partial
+from collections import defaultdict
+from contextlib import contextmanager
 try:
     from tqdm import tqdm
 except ImportError:
     print("警告: tqdmライブラリが見つかりません。進捗バーなしで処理を続行します。")
     print("より良い体験のために 'pip install tqdm' の実行をお勧めします。")
-    # tqdmがない場合のダミー関数を定義
     def tqdm(iterable, **kwargs):
         return iterable
 # --- ▲▲▲ 追加はここまで ▲▲▲ ---
@@ -37,30 +40,45 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QGraphicsView,
 
 
 CACHE_DIR = ".Photogrammetry_Ortho_Image_Refiner_cache"
+GRID_SIZE = 512
+THUMBNAIL_SIZE = 450
 
+@contextmanager
+def suppress_stderr():
+    """
+    OSレベルで標準エラー出力を抑制するコンテキストマネージャ。
+    Cライブラリ(libpngなど)が出力する警告がtqdmの表示を崩すのを防ぐ。
+    """
+    stderr_fd = sys.stderr.fileno()
+    saved_stderr_fd = os.dup(stderr_fd)
+    try:
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull_fd, stderr_fd)
+        os.close(devnull_fd)
+        yield
+    finally:
+        os.dup2(saved_stderr_fd, stderr_fd)
+        os.close(saved_stderr_fd)
 
-def _get_image_hash(image_path):
-    hasher = hashlib.md5()
-    with open(image_path, 'rb') as f:
-        hasher.update(f.read())
-    return hasher.hexdigest()
-
+def _get_cache_path(ortho_path, detail_path):
+    safe_ortho_name = "".join(c if c.isalnum() else "_" for c in os.path.basename(ortho_path))
+    safe_detail_name = "".join(c if c.isalnum() else "_" for c in os.path.basename(detail_path))
+    try:
+        mtime = int(os.path.getmtime(detail_path))
+    except OSError:
+        mtime = 0
+    cache_filename = f"{safe_ortho_name}_{safe_detail_name}_{mtime}.pkl"
+    return os.path.join(CACHE_DIR, cache_filename)
 
 def save_cache(ortho_path, detail_path, data):
     if not os.path.exists(CACHE_DIR):
         os.makedirs(CACHE_DIR)
-    cache_filename = (
-        f"{_get_image_hash(ortho_path)}_{_get_image_hash(detail_path)}.pkl"
-    )
-    with open(os.path.join(CACHE_DIR, cache_filename), 'wb') as f:
+    cache_path = _get_cache_path(ortho_path, detail_path)
+    with open(cache_path, 'wb') as f:
         pickle.dump(data, f)
 
-
 def load_cache(ortho_path, detail_path):
-    cache_filename = (
-        f"{_get_image_hash(ortho_path)}_{_get_image_hash(detail_path)}.pkl"
-    )
-    cache_path = os.path.join(CACHE_DIR, cache_filename)
+    cache_path = _get_cache_path(ortho_path, detail_path)
     if os.path.exists(cache_path):
         with open(cache_path, 'rb') as f:
             try:
@@ -69,7 +87,6 @@ def load_cache(ortho_path, detail_path):
                 print(f"\n警告: キャッシュファイルの読み込みに失敗しました: {cache_path}")
                 return None
     return None
-
 
 def export_to_psd(original_ortho_path, png_layer_paths, output_dir):
     if not os.path.exists(output_dir): os.makedirs(output_dir)
@@ -118,6 +135,20 @@ DEDUPLICATION_GRID_SIZE = 5.0
 RATIO_TEST_THRESHOLD = 0.75
 RANSAC_REPROJ_THRESHOLD = 3.0
 
+def calculate_overlapping_grids(points, ortho_width):
+    if points is None or len(points) == 0:
+        return []
+    points_np = np.array(points, dtype=np.int32).reshape(-1, 2)
+    x, y, w, h = cv2.boundingRect(points_np)
+    min_col = max(0, x // GRID_SIZE)
+    max_col = min((ortho_width - 1) // GRID_SIZE, (x + w) // GRID_SIZE)
+    min_row = y // GRID_SIZE
+    max_row = (y + h) // GRID_SIZE
+    grid_ids = []
+    for r in range(min_row, max_row + 1):
+        for c in range(min_col, max_col + 1):
+            grid_ids.append((r, c))
+    return grid_ids
 
 def detect_features_in_tile(args):
     tile, offset_x, offset_y = args
@@ -165,8 +196,9 @@ class ImageProcessor(QObject):
     def run_processing(self, ortho_path, detail_path):
         try:
             self._update_status("画像を読み込んでいます...")
-            ortho_img = cv2.imread(ortho_path)
-            detail_img = cv2.imread(detail_path)
+            with suppress_stderr():
+                ortho_img = cv2.imread(ortho_path)
+                detail_img = cv2.imread(detail_path)
             if ortho_img is None or detail_img is None: raise FileNotFoundError("画像ファイルの読み込みに失敗しました。")
             data = self._perform_fine_alignment(ortho_img, detail_img)
             polygons = self._generate_extension_polygons(data['hull_points'], data['warped_corners'])
@@ -340,8 +372,9 @@ class UpdateWorker(QObject):
     @Slot(str, str)
     def run(self, current_ortho_path, overlay_png_path):
         try:
-            base_img = cv2.imread(current_ortho_path)
-            overlay_img = cv2.imread(overlay_png_path, cv2.IMREAD_UNCHANGED)
+            with suppress_stderr():
+                base_img = cv2.imread(current_ortho_path)
+                overlay_img = cv2.imread(overlay_png_path, cv2.IMREAD_UNCHANGED)
             if base_img is None: raise FileNotFoundError(f"ベース画像の読み込みに失敗: {current_ortho_path}")
             if overlay_img is None: raise FileNotFoundError(f"オーバーレイ画像の読み込みに失敗: {overlay_png_path}")
             alpha = overlay_img[:, :, 3] / 255.0
@@ -351,6 +384,65 @@ class UpdateWorker(QObject):
             cv2.imwrite(temp_path, base_img)
             self.finished.emit(temp_path, overlay_png_path, base_img)
         except Exception as e: self.error.emit(str(e))
+
+
+class CandidateSearchWorker(QObject):
+    finished = Signal(list)
+    error = Signal(str)
+    status_updated = Signal(str)
+
+    def __init__(self, candidate_list, grid_to_candidates):
+        super().__init__()
+        self.candidate_list = candidate_list
+        self.grid_to_candidates = grid_to_candidates
+
+    def _create_thumbnail_image(self, path):
+        try:
+            with suppress_stderr():
+                image = QImage(path)
+            if image.isNull():
+                return None
+            return (path, image.scaled(THUMBNAIL_SIZE, THUMBNAIL_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        except Exception:
+            return None
+
+    @Slot(QPolygonF, int)
+    def run_search(self, selection_polygon, ortho_width):
+        try:
+            self.status_updated.emit("候補を絞り込んでいます...")
+            rect = selection_polygon.boundingRect()
+            points = [(rect.left(), rect.top()), (rect.right(), rect.top()),
+                      (rect.right(), rect.bottom()), (rect.left(), rect.bottom())]
+            target_grids = calculate_overlapping_grids(points, ortho_width)
+
+            candidate_indices = set()
+            for grid_id in target_grids:
+                candidate_indices.update(self.grid_to_candidates.get(grid_id, []))
+
+            intersecting_paths = []
+            for idx in sorted(list(candidate_indices)):
+                candidate = self.candidate_list[idx]
+                if candidate["polygon"].intersects(selection_polygon):
+                    intersecting_paths.append(candidate["path"])
+            
+            if not intersecting_paths:
+                self.finished.emit([])
+                return
+
+            self.status_updated.emit(f"{len(intersecting_paths)}件のサムネイルを並列生成中...")
+            candidates_with_images = []
+            max_workers = min(16, (os.cpu_count() or 1) * 4)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                results = executor.map(self._create_thumbnail_image, intersecting_paths)
+                candidates_with_images = [res for res in results if res is not None]
+
+            self.status_updated.emit(f"候補検索完了。 {len(candidates_with_images)}件見つかりました。")
+            self.finished.emit(candidates_with_images)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(f"候補検索中にエラーが発生しました: {e}")
 
 
 class PhotoViewer(QGraphicsView):
@@ -401,40 +493,95 @@ class PhotoViewer(QGraphicsView):
     def clear_selection(self): self.selection_rect_item.hide()
 
 
+# --- ▼▼▼【修正】CandidateDialogのレイアウトと機能性を改善 ▼▼▼ ---
 class CandidateDialog(QDialog):
     def __init__(self, candidates, parent=None):
         super().__init__(parent)
         self.setWindowTitle("候補画像の選択")
         self.selected_path = None
         layout, self.list_widget = QVBoxLayout(self), QListWidget()
-        self.list_widget.setIconSize(QSize(150, 150))
-        self.list_widget.itemDoubleClicked.connect(self.accept)
+
+        # --- 表示モードとレイアウトの設定 ---
+        self.list_widget.setViewMode(QListWidget.IconMode)  # アイコンを上に、テキストを下に配置
+        self.list_widget.setResizeMode(QListWidget.Adjust)   # ウィンドウサイズ変更に追従してアイテムを再配置
+        self.list_widget.setWordWrap(True)                   # ファイル名を折り返して表示
+        self.list_widget.setSpacing(15)                      # アイテム間の余白を調整
+
+        self.list_widget.setIconSize(QSize(THUMBNAIL_SIZE, THUMBNAIL_SIZE))
+        
+        # --- ★ダブルクリックの接続先を accept から新しいメソッドに変更 ---
+        self.list_widget.itemDoubleClicked.connect(self.on_item_double_clicked)
+
         for path, thumb in candidates:
-            item = QListWidgetItem(os.path.basename(path))
+            filename = os.path.basename(path)
+            item = QListWidgetItem(filename)
+            
             item.setIcon(QIcon(thumb))
             item.setData(Qt.UserRole, path)
+            # --- ★ ツールチップを追加して、フルパスを表示 ---
+            item.setToolTip(path)
+            item.setTextAlignment(Qt.AlignCenter)
+            
             self.list_widget.addItem(item)
+            
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(self.list_widget)
         layout.addWidget(buttons)
+        self.resize(THUMBNAIL_SIZE + 100, 800)
+
+    def on_item_double_clicked(self, item):
+        """
+        リストアイテムがダブルクリックされたときに、
+        対応する画像をOSのデフォルトビューアーで開く。
+        """
+        path = item.data(Qt.UserRole)
+        try:
+            filepath = os.path.realpath(path)
+            if sys.platform == "win32":
+                os.startfile(filepath)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", filepath])
+            else:
+                subprocess.Popen(["xdg-open", filepath])
+        except Exception as e:
+            QMessageBox.warning(self, "エラー", f"ファイルを開けませんでした:\n{path}\n\n詳細: {e}")
+
     def accept(self):
-        if self.list_widget.selectedItems():
-            self.selected_path = self.list_widget.selectedItems()[0].data(Qt.UserRole)
+        """
+        OKボタンまたはEnterキーで呼び出される。
+        現在選択されているアイテムを最終的な選択として確定する。
+        """
+        selected_items = self.list_widget.selectedItems()
+        if selected_items:
+            self.selected_path = selected_items[0].data(Qt.UserRole)
             super().accept()
+        else:
+            # 何も選択されていなくてもダイアログを閉じる
+            super().accept()
+# --- ▲▲▲ 修正はここまで ▲▲▲ ---
 
 
 class MainWindow(QMainWindow):
     start_processing_signal = Signal(str, str)
     start_update_signal = Signal(str, str)
+    start_candidate_search_signal = Signal(QPolygonF, int)
 
     def __init__(self, ortho_path, detail_dir, preloaded_cache):
         super().__init__()
         self.setWindowTitle("Photogrammetry_Ortho_Image_Refiner")
         self.setGeometry(100, 100, 1400, 900)
         self.initial_ortho_path, self.detail_dir = ortho_path, detail_dir
-        self.candidate_cache = preloaded_cache
+        
+        self.candidate_list = preloaded_cache
+        grid_to_candidates_default = defaultdict(list)
+        for idx, candidate in enumerate(self.candidate_list):
+            if 'grid_ids' in candidate:
+                for grid_id in candidate['grid_ids']:
+                    grid_to_candidates_default[grid_id].append(idx)
+        self.grid_to_candidates = dict(grid_to_candidates_default)
+
         self.generated_pngs, self.data = [], None
         self.selectable_items, self.selected_states = [], []
         self.current_ortho_path = self.initial_ortho_path
@@ -456,6 +603,7 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(button_layout)
         central_widget.setLayout(main_layout)
         self.setCentralWidget(central_widget)
+        
         self.proc_thread = QThread()
         self.processor = ImageProcessor()
         self.processor.moveToThread(self.proc_thread)
@@ -464,24 +612,52 @@ class MainWindow(QMainWindow):
         self.processor.composition_saved.connect(self.on_composition_saved)
         self.processor.processing_error.connect(self.on_processing_error)
         self.processor.status_updated.connect(self.status_label.setText)
+        
         self.update_thread = QThread()
         self.update_worker = UpdateWorker()
         self.update_worker.moveToThread(self.update_thread)
         self.start_update_signal.connect(self.update_worker.run)
         self.update_worker.finished.connect(self.on_update_finished)
         self.update_worker.error.connect(self.on_processing_error)
+
+        self.search_thread = QThread()
+        self.search_worker = CandidateSearchWorker(self.candidate_list, self.grid_to_candidates)
+        self.search_worker.moveToThread(self.search_thread)
+        self.start_candidate_search_signal.connect(self.search_worker.run_search)
+        self.search_worker.finished.connect(self.on_candidate_search_finished)
+        self.search_worker.error.connect(self.on_processing_error)
+        self.search_worker.status_updated.connect(self.status_label.setText)
+
         self.view.region_selected.connect(self.on_region_selected)
         self.find_button.clicked.connect(self.on_find_button_clicked)
         self.confirm_button.clicked.connect(self.save_result)
         self.export_button.clicked.connect(self.export_project)
+        
         self.proc_thread.start()
         self.update_thread.start()
+        self.search_thread.start()
+        
         self.setup_scene()
         self.reset_ui_state()
 
+    def keyPressEvent(self, event):
+        """Enterキーが押されたときの動作を定義する。"""
+        if event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter:
+            if self.find_button.isEnabled():
+                self.find_button.click()
+                event.accept()
+                return
+            elif self.confirm_button.isEnabled():
+                self.save_result()
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
     def setup_scene(self):
-        ortho_cv_img = cv2.imread(self.current_ortho_path)
+        with suppress_stderr():
+            ortho_cv_img = cv2.imread(self.current_ortho_path)
         if ortho_cv_img is None: self.on_processing_error("OpenCVでのオルソ画像の読み込みに失敗しました。"); return
+        self.ortho_image_width = ortho_cv_img.shape[1]
         pixmap = self._cv_to_qpixmap(ortho_cv_img)
         if pixmap.isNull(): self.on_processing_error("オルソ画像の表示に失敗"); return
         self.base_pixmap_item = self.scene.addPixmap(pixmap)
@@ -508,19 +684,35 @@ class MainWindow(QMainWindow):
         self.view.selection_rect_item.show()
         self.current_selection_rect = rect
         self.find_button.setEnabled(True)
-        self.status_label.setText("領域を選択しました。「② この領域で候補を検索」ボタンを押してください。")
+        self.status_label.setText("領域を選択しました。「② この領域で候補を検索」ボタンを押すか、Enterキーを押してください。")
 
     def on_find_button_clicked(self):
         self.view.clear_selection()
-        candidates = self.find_candidate_images(QPolygonF(self.current_selection_rect))
-        if not candidates:
-            QMessageBox.information(self, "情報", "選択領域にマッチする画像が見つかりませんでした。"); self.reset_ui_state(); return
-        dialog = CandidateDialog(candidates, self)
-        if dialog.exec():
+        self.find_button.setEnabled(False)
+        self.status_label.setText("候補を検索中です...")
+        self.start_candidate_search_signal.emit(
+            QPolygonF(self.current_selection_rect),
+            self.ortho_image_width
+        )
+    
+    @Slot(list)
+    def on_candidate_search_finished(self, candidates_with_images):
+        if not candidates_with_images:
+            QMessageBox.information(self, "情報", "選択領域にマッチする画像が見つかりませんでした。")
+            self.reset_ui_state()
+            return
+
+        candidates_with_pixmaps = []
+        for path, image in candidates_with_images:
+            candidates_with_pixmaps.append((path, QPixmap.fromImage(image)))
+
+        dialog = CandidateDialog(candidates_with_pixmaps, self)
+        if dialog.exec() and dialog.selected_path:
             self.find_button.setEnabled(False)
             self.status_label.setText("高精度計算をバックグラウンドで開始します...")
             self.start_processing_signal.emit(self.current_ortho_path, dialog.selected_path)
-        else: self.reset_ui_state()
+        else:
+            self.reset_ui_state()
 
     def on_processing_finished(self, data):
         self.data = data
@@ -546,7 +738,7 @@ class MainWindow(QMainWindow):
             self.selectable_items.append(item)
             self.selected_states.append(False)
         self.confirm_button.setEnabled(True)
-        self.status_label.setText("③ 合成に含めたい拡張領域をクリックし、「選択を確定して合成」を押してください。")
+        self.status_label.setText("③ 合成に含めたい拡張領域をクリックし、「選択を確定して合成」を押すか、Enterキーを押してください。")
 
     def toggle_selection(self, index):
         self.selected_states[index] = not self.selected_states[index]
@@ -584,14 +776,6 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "エラー", message)
         self.reset_ui_state()
 
-    def find_candidate_images(self, selection_polygon):
-        candidates_with_thumbs = []
-        for candidate in self.candidate_cache:
-            if candidate["polygon"].intersects(selection_polygon):
-                path = candidate["path"]
-                candidates_with_thumbs.append((path, QPixmap(path).scaled(150, 150, Qt.KeepAspectRatio, Qt.SmoothTransformation)))
-        return candidates_with_thumbs
-
     def _cv_to_qpixmap(self, cv_img):
         h, w, ch = cv_img.shape
         bytes_per_line = ch * w
@@ -610,8 +794,10 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.proc_thread.quit()
         self.update_thread.quit()
+        self.search_thread.quit()
         self.proc_thread.wait()
         self.update_thread.wait()
+        self.search_thread.wait()
         for f in self.temp_files:
             try: os.remove(f)
             except OSError as e: print(f"一時ファイルの削除に失敗: {e}")
@@ -624,68 +810,56 @@ def run_precomputation_coarse(ortho_path, detail_dir):
     detail_paths = glob.glob(os.path.join(detail_dir, "*.jpg")) + glob.glob(os.path.join(detail_dir, "*.png"))
     if not detail_paths:
         print("警告: 指定されたディレクトリに詳細画像が見つかりませんでした。"); return
-    try: ortho_hash = _get_image_hash(ortho_path)
-    except FileNotFoundError: print(f"!!! エラー: オルソ画像が見つかりません: {ortho_path}"); return
-    existing_detail_hashes = set()
-    if os.path.exists(CACHE_DIR):
-        prefix = f"{ortho_hash}_"
-        for filename in os.listdir(CACHE_DIR):
-            if filename.startswith(prefix) and filename.endswith(".pkl"): existing_detail_hashes.add(filename[len(prefix):-4])
-    ortho_img = cv2.imread(ortho_path)
-    if ortho_img is None: print(f"!!! エラー: オルソ画像が読み込めません: {ortho_path}"); return
+    
+    with suppress_stderr():
+        ortho_img = cv2.imread(ortho_path)
+    if ortho_img is None: 
+        print(f"!!! エラー: オルソ画像が読み込めません: {ortho_path}"); return
+    ortho_width = ortho_img.shape[1]
+
     newly_cached_count = 0
-    for i, detail_path in enumerate(tqdm(detail_paths, desc="事前計算")):
+    for detail_path in tqdm(detail_paths, desc="事前計算", ascii=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
         try:
-            detail_hash = _get_image_hash(detail_path)
-            if detail_hash in existing_detail_hashes: continue
-            detail_img = cv2.imread(detail_path)
+            cache_path = _get_cache_path(ortho_path, detail_path)
+            if os.path.exists(cache_path):
+                continue
+            with suppress_stderr():
+                detail_img = cv2.imread(detail_path)
             if detail_img is None: raise FileNotFoundError("詳細画像ファイルの読み込みに失敗しました。")
-            coarse_alignment_data = perform_coarse_alignment_headless(ortho_img, detail_img)
-            cache_data = {"warped_corners": coarse_alignment_data["warped_corners"]}
+            with suppress_stderr():
+                coarse_alignment_data = perform_coarse_alignment_headless(ortho_img, detail_img)
+            warped_corners = coarse_alignment_data["warped_corners"]
+            grid_ids = calculate_overlapping_grids(warped_corners, ortho_width)
+            cache_data = {
+                "warped_corners": warped_corners,
+                "grid_ids": grid_ids,
+            }
             save_cache(ortho_path, detail_path, cache_data)
-            existing_detail_hashes.add(detail_hash)
             newly_cached_count += 1
         except Exception as e:
-            # tqdmを使っている場合、エラーメッセージがバーで上書きされないようにする
             tqdm.write(f"\n!!! エラーが発生しました: {os.path.basename(detail_path)} - {e}")
     print(f"\n--- 事前計算が完了しました ({newly_cached_count}件のキャッシュを新規作成) ---")
 
-# --- ▼▼▼【修正】並列処理でキャッシュを高速に読み込む関数 ▼▼▼ ---
 def _load_single_cache_worker(detail_path, ortho_path):
-    """
-    単一のキャッシュファイルを読み込むためのワーカー関数。
-    並列処理の各スレッドで実行される。
-    """
     cache = load_cache(ortho_path, detail_path)
-    if cache and 'warped_corners' in cache:
-        return {"path": detail_path, "corners_np": cache['warped_corners']}
+    if cache and 'warped_corners' in cache and 'grid_ids' in cache:
+        return {
+            "path": detail_path, 
+            "corners_np": cache['warped_corners'],
+            "grid_ids": cache['grid_ids']
+        }
     return None
 
 def preload_candidate_data_parallel(ortho_path, detail_dir):
-    """
-    ThreadPoolExecutorを使用して、キャッシュ読み込みを並列化する。
-    """
     print("--- キャッシュの並列読み込みを開始します ---")
     detail_paths = glob.glob(os.path.join(detail_dir, "*.jpg")) + glob.glob(os.path.join(detail_dir, "*.png"))
-    preloaded_cache = []
-    
-    # partialを使って、ortho_pathをワーカー関数に固定引数として渡す
     worker = partial(_load_single_cache_worker, ortho_path=ortho_path)
-    
-    # I/Oバウンドなタスクなので、スレッド数を多めに設定しても良い
-    # os.cpu_count() * 5 は一般的な推奨値だが、環境に応じて調整可能
     max_workers = min(32, (os.cpu_count() or 1) * 5)
-    
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # executor.mapで全タスクを投入し、tqdmで進捗を表示
-        results = list(tqdm(executor.map(worker, detail_paths), total=len(detail_paths), desc="キャッシュ読み込み"))
-
-    # Noneではない結果（正常に読み込めたキャッシュ）だけをリストに追加
+        results = list(tqdm(executor.map(worker, detail_paths), total=len(detail_paths), desc="キャッシュ読み込み", ascii=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'))
     preloaded_cache = [res for res in results if res is not None]
-            
     print(f"--- {len(preloaded_cache)} 件のキャッシュ読み込みが完了しました ---")
     return preloaded_cache
-# --- ▲▲▲ 修正はここまで ▲▲▲ ---
 
 if __name__ == '__main__':
     freeze_support()
@@ -694,23 +868,19 @@ if __name__ == '__main__':
     parser.add_argument('detail_images_dir', help='高解像度詳細画像が含まれるディレクトリ')
     args = parser.parse_args()
 
-    # --- ワークフロー ①: コマンドラインで事前計算を実行 ---
     run_precomputation_coarse(args.ortho_image, args.detail_images_dir)
-
-    # --- ワークフロー ②: コマンドラインでキャッシュを並列で高速にメモリへロード ---
     preloaded_cache_np = preload_candidate_data_parallel(args.ortho_image, args.detail_images_dir)
 
-    # --- ワークフロー ③: 全ての準備完了後、GUIを起動 ---
     print("GUIを起動します...")
     app = QApplication(sys.argv)
     
-    # Qtオブジェクト(QPolygonF)はQApplicationインスタンスの作成後に生成する必要がある
     preloaded_cache_qt = []
     for data in preloaded_cache_np:
         polygon = QPolygonF([QPointF(p[0], p[1]) for p in data['corners_np']])
         preloaded_cache_qt.append({
             "path": data["path"],
-            "polygon": polygon
+            "polygon": polygon,
+            "grid_ids": data["grid_ids"]
         })
 
     window = MainWindow(args.ortho_image, args.detail_images_dir, preloaded_cache_qt)
